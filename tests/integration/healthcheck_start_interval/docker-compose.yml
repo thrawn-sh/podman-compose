@@ -1,0 +1,19 @@
+services:
+  app:
+    image: nopush/podman-compose-test
+    command: ["sleep", "infinity"]
+    healthcheck:
+      # becomes healthy on the third run of the healthcheck
+      test: ["CMD-SHELL", "echo x >> /tmp/healthchecks; test $(wc -l < /tmp/healthchecks) -ge 3"]
+      interval: 300s
+      timeout: 5s
+      retries: 1
+      start_period: 60s
+      start_interval: 1s
+
+  dependent:
+    image: nopush/podman-compose-test
+    command: ["sleep", "infinity"]
+    depends_on:
+      app:
+        condition: service_healthy

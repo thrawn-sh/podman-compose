@@ -1,0 +1,5 @@
+Fixed ``healthcheck.start_interval`` having no effect. It was translated to podman's
+``--health-startup-interval``, which podman ignores unless a separate startup healthcheck
+command is configured and which does not follow the compose semantics. The healthcheck is
+now triggered by podman-compose itself every ``start_interval`` while a container is within
+its ``start_period``.

@@ -1189,10 +1189,30 @@ class TestContainerToArgs(unittest.IsolatedAsyncioTestCase):
                 '10s',
                 '--health-start-period',
                 '5s',
-                '--health-startup-interval',
-                '6s',
                 '--health-retries',
                 '3',
+                "busybox",
+            ],
+        )
+
+    async def test_healthcheck_start_interval_is_not_passed_to_podman(self) -> None:
+        # 'start_interval' has no podman equivalent, it is emulated at runtime instead
+        c = create_compose_mock()
+        cnt = get_minimal_container()
+        cnt["healthcheck"] = {
+            "interval": "1m",
+            "start_interval": "6s",
+        }
+
+        args = await container_to_args(c, cnt)
+        self.assertEqual(
+            args,
+            [
+                "--name=project_name_service_name1",
+                "-d",
+                "--network=bridge:alias=service_name",
+                '--health-interval',
+                '1m',
                 "busybox",
             ],
         )

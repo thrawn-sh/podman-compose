@@ -27,6 +27,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from asyncio import Task
 from dataclasses import dataclass
@@ -130,6 +131,7 @@ PODMAN_CMDS = (
 
 t_re = re.compile(r"^(?:(\d+)[m:])?(?:(\d+(?:\.\d+)?)s?)?$")
 STOP_GRACE_PERIOD = "10"
+HEALTH_STATUS_STARTING = "starting"
 
 
 def str_to_seconds(txt: int | str | None) -> int | None:
@@ -147,6 +149,29 @@ def str_to_seconds(txt: int | str | None) -> int | None:
     # Error: invalid argument "3.0" for "-t, --time" flag: strconv.ParseUint: parsing "3.0":
     # invalid syntax
     return int(mins * 60.0 + sec)
+
+
+duration_re = re.compile(r"(\d+(?:\.\d+)?)(us|ms|s|m|h)")
+
+
+def parse_duration_seconds(txt: int | float | str | None) -> float | None:
+    """Parse a compose duration such as '1m30s' or '500ms' into seconds.
+
+    Unlike str_to_seconds() this keeps sub-second precision and understands all units
+    allowed by the compose specification. Returns None if the value cannot be parsed.
+    """
+    if txt is None:
+        return None
+    if not isinstance(txt, str):
+        return float(txt)
+    txt = txt.strip()
+    if not txt:
+        return None
+    units = {"us": 0.000001, "ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+    matches = list(duration_re.finditer(txt))
+    if not matches or "".join(m.group(0) for m in matches) != txt:
+        return None
+    return sum(float(m.group(1)) * units[m.group(2)] for m in matches)
 
 
 def ver_as_list(a: str) -> list[int]:
@@ -1576,8 +1601,11 @@ async def container_to_args(
         podman_args.extend(["--health-timeout", healthcheck["timeout"]])
     if "start_period" in healthcheck:
         podman_args.extend(["--health-start-period", healthcheck["start_period"]])
-    if "start_interval" in healthcheck:
-        podman_args.extend(["--health-startup-interval", healthcheck["start_interval"]])
+    # 'start_interval' has no podman equivalent: podman's --health-startup-interval configures
+    # a separate startup healthcheck with different semantics (it is not bound by
+    # --health-start-period and is only created when --health-startup-cmd is given). It is
+    # emulated by triggering the regular healthcheck from podman-compose instead, see
+    # emulate_start_interval().
 
     # convert other parameters to string
     if "retries" in healthcheck:
@@ -3833,6 +3861,61 @@ async def _validate_completed_successfully(
             raise RuntimeError(error_msg)
 
 
+async def emulate_start_interval(compose: PodmanCompose, cnt: dict[str, Any]) -> None:
+    """Emulate compose's 'healthcheck.start_interval' for a single container.
+
+    Podman has no equivalent of 'start_interval': its own healthcheck timer always uses
+    'interval', and its startup healthcheck (--health-startup-cmd) follows different rules.
+    Podman does however run the regular healthcheck on demand via 'podman healthcheck run',
+    and while the container is within '--health-start-period' a failing check keeps the
+    container in the 'starting' state instead of marking it unhealthy, which is exactly the
+    behaviour compose asks for. So trigger the check ourselves every 'start_interval' until
+    the container becomes healthy or the start period elapses. Afterwards podman's own timer
+    keeps checking at 'interval'.
+    """
+    healthcheck = cnt.get("healthcheck") or {}
+    name = cnt["name"]
+    start_interval = parse_duration_seconds(healthcheck.get("start_interval"))
+    if start_interval is None or start_interval <= 0:
+        return
+    # compose defaults 'start_period' to 0s, in which case there is nothing to speed up
+    start_period = parse_duration_seconds(healthcheck.get("start_period")) or 0.0
+    deadline = time.monotonic() + start_period
+
+    while time.monotonic() < deadline:
+        await asyncio.sleep(start_interval)
+        try:
+            status_raw = await compose.podman.output(
+                [], "inspect", ["--format", "{{.State.Health.Status}}", name]
+            )
+        except subprocess.CalledProcessError:
+            # container is gone or was never started
+            return
+        status = status_raw.decode().strip()
+        if status != HEALTH_STATUS_STARTING:
+            return
+        log.debug("running healthcheck of container %s (start_interval)", name)
+        try:
+            await compose.podman.output([], "healthcheck", ["run", name])
+        except subprocess.CalledProcessError:
+            # a failing healthcheck is expected during the start period
+            pass
+
+
+def create_start_interval_tasks(
+    compose: PodmanCompose, excluded: set[str]
+) -> set[asyncio.Task[None]]:
+    """Create the 'healthcheck.start_interval' emulation tasks of all started containers"""
+    tasks = set()
+    for cnt in compose.containers:
+        if cnt["_service"] in excluded:
+            continue
+        if not (cnt.get("healthcheck") or {}).get("start_interval"):
+            continue
+        tasks.add(asyncio.create_task(emulate_start_interval(compose, cnt)))
+    return tasks
+
+
 async def check_dep_conditions(compose: PodmanCompose, deps: set) -> None:
     """Enforce that all specified conditions in deps are met"""
     if not deps:
@@ -4268,17 +4351,25 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
     if args.detach:
         log.info("starting containers (detached): ...")
         start_error_codes: list[int | None] = []
-        for cnt in compose.containers:
-            if cnt["_service"] in excluded:
-                log.debug("** skipping start: %s", cnt["name"])
-                continue
-            exit_code = await run_container(
-                compose, cnt["name"], deps_from_container(args, cnt), ([], "start", [cnt["name"]])
-            )
-            start_error_codes.append(exit_code)
+        start_interval_tasks = create_start_interval_tasks(compose, excluded)
+        try:
+            for cnt in compose.containers:
+                if cnt["_service"] in excluded:
+                    log.debug("** skipping start: %s", cnt["name"])
+                    continue
+                exit_code = await run_container(
+                    compose,
+                    cnt["name"],
+                    deps_from_container(args, cnt),
+                    ([], "start", [cnt["name"]]),
+                )
+                start_error_codes.append(exit_code)
 
-        if args.wait:
-            await wait_for_container_running_healthy(compose, args)
+            if args.wait:
+                await wait_for_container_running_healthy(compose, args)
+        finally:
+            for start_interval_task in start_interval_tasks:
+                start_interval_task.cancel()
 
         # return first error code from start calls, if any
         return next((code for code in start_error_codes if code is not None and code != 0), 0)
@@ -4298,6 +4389,7 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
         max_service_length = curr_length if curr_length > max_service_length else max_service_length
 
     tasks: set[asyncio.Task] = set()
+    start_interval_tasks = create_start_interval_tasks(compose, excluded)
 
     async def handle_sigint() -> None:
         log.info("Caught SIGINT or Ctrl+C, shutting down...")
@@ -4308,7 +4400,7 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
         except Exception as e:
             log.error("Error during shutdown: %s", e)
         finally:
-            for task in tasks:
+            for task in tasks | start_interval_tasks:
                 task.cancel()
 
     if sys.platform != 'win32':
@@ -4395,6 +4487,9 @@ async def compose_up(compose: PodmanCompose, args: argparse.Namespace) -> int | 
                 for t_ in done:
                     if t_.get_name() == exit_code_from:
                         exit_code = t_.result()
+
+    for start_interval_task in start_interval_tasks:
+        start_interval_task.cancel()
     return exit_code
 
 
